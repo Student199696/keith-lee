@@ -76,7 +76,7 @@ async function persistInquiry(id: string, record: InquiryRecord, files: Array<{ 
 
     files.forEach(({ file }, index) => statements.push(runtimeEnv.DB!.prepare("INSERT INTO inquiry_files (id, inquiry_id, object_key, original_name, content_type, size) VALUES (?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), id, uploaded[index], file.name.slice(0, 160), file.type, file.size)));
     await runtimeEnv.DB.batch(statements);
-    return "database+email" as const;
+    return "database" as const;
   } catch (error) {
     await Promise.all(uploaded.map((key) => runtimeEnv.BUCKET!.delete(key).catch(() => undefined)));
     throw error;
@@ -104,9 +104,6 @@ export async function POST(request: Request) {
     for (const file of attachments) {
       if (!allowedTypes.has(file.type)) return NextResponse.json({ error: `${file.name} is not an accepted file type.` }, { status: 400 });
     }
-
-    const config = emailConfig();
-    if (!config.apiKey) return NextResponse.json({ error: "Email delivery is not configured yet. Please contact the partnership team directly." }, { status: 503 });
 
     const id = crypto.randomUUID();
     const reference = `KL-${new Date().getUTCFullYear()}-${id.slice(0, 8).toUpperCase()}`;
@@ -138,17 +135,33 @@ export async function POST(request: Request) {
     const preparedFiles = await Promise.all(attachments.map(async (file) => ({ file, bytes: await file.arrayBuffer() })));
     const emailAttachments: EmailAttachment[] = preparedFiles.map(({ file, bytes }) => ({ filename: safeFilename(file.name), content: toBase64(bytes) }));
     const captureMode = await persistInquiry(id, record, preparedFiles);
+    const config = emailConfig();
 
-    await sendEmail(config.apiKey, {
-      from: config.from,
-      to: [config.to],
-      reply_to: email,
-      subject: `[${reference}] ${record.organization.replace(/[\r\n]+/g, " ")} - ${record.engagementType}`,
-      html: internalEmail(record, emailAttachments),
-      text: internalText(record),
-      attachments: emailAttachments,
-      tags: [{ name: "inquiry_reference", value: reference.replace(/[^a-zA-Z0-9_-]/g, "_") }],
-    }, `${reference}-internal`);
+    if (!config.apiKey) {
+      if (captureMode === "database") {
+        console.warn(`Inquiry ${reference} was stored, but email delivery is not configured.`);
+        return NextResponse.json({ reference, confirmationDelivered: false, notificationDelivered: false, captureMode }, { status: 201 });
+      }
+      return NextResponse.json({ error: "Inquiry delivery is not configured yet. Please contact the partnership team directly." }, { status: 503 });
+    }
+
+    let notificationDelivered = true;
+    try {
+      await sendEmail(config.apiKey, {
+        from: config.from,
+        to: [config.to],
+        reply_to: email,
+        subject: `[${reference}] ${record.organization.replace(/[\r\n]+/g, " ")} - ${record.engagementType}`,
+        html: internalEmail(record, emailAttachments),
+        text: internalText(record),
+        attachments: emailAttachments,
+        tags: [{ name: "inquiry_reference", value: reference.replace(/[^a-zA-Z0-9_-]/g, "_") }],
+      }, `${reference}-internal`);
+    } catch (error) {
+      if (captureMode === "email") throw error;
+      notificationDelivered = false;
+      console.error("Inquiry notification email failed after database capture", error);
+    }
 
     let confirmationDelivered = true;
     try {
@@ -166,7 +179,12 @@ export async function POST(request: Request) {
       console.error("Inquiry confirmation email failed", error);
     }
 
-    return NextResponse.json({ reference, confirmationDelivered, captureMode }, { status: 201 });
+    return NextResponse.json({
+      reference,
+      confirmationDelivered,
+      notificationDelivered,
+      captureMode: captureMode === "database" ? "database+email" : captureMode,
+    }, { status: 201 });
   } catch (error) {
     console.error("Inquiry submission failed", error);
     return NextResponse.json({ error: "The inquiry could not be sent. Please keep your information and try again." }, { status: 500 });
